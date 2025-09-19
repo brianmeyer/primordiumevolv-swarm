@@ -1,8 +1,6 @@
-name: CI
+name: CI (manual)
 
 on:
-  push:
-    branches: [ main ]
   workflow_dispatch:
     inputs:
       run_smoke:
@@ -69,4 +67,3 @@ jobs:
           set +e
           PYTHONPATH=. python app/gold/eval.py || true
           PYTHONPATH=. python app/gold/summary.py || true
-
