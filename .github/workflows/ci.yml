@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      run_smoke:
+        description: "Run HRM smoke (requires local Ollama on runner)"
+        type: boolean
+        default: false
+      run_gold:
+        description: "Run gold eval (requires local Ollama on runner)"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Try requirements.txt if present, else install minimal deps
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install --no-input beautifulsoup4 httpx ddgs duckduckgo-search ollama
+      - name: Syntax check
+        run: python -m compileall -q .
+
+  smoke:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_smoke == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install beautifulsoup4 httpx ddgs duckduckgo-search ollama
+      - name: Health (best-effort)
+        run: |
+          set +e
+          PYTHONPATH=. python app/scripts/run_health.py || true
+      - name: HRM smoke (best-effort)
+        run: |
+          set +e
+          PYTHONPATH=. python -m app.scripts.smoke_hrm "summarize today’s AI news with exactly two citations" || true
+
+  gold:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_gold == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install beautifulsoup4 httpx ddgs duckduckgo-search ollama
+      - name: Gold eval (best-effort)
+        run: |
+          set +e
+          PYTHONPATH=. python app/gold/eval.py || true
+          PYTHONPATH=. python app/gold/summary.py || true
+
