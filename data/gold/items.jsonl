@@ -1,0 +1,5 @@
+{"id": "g001", "query": "today AI research news", "allowed_urls": [], "notes": "news+citations"}
+{"id": "g002", "query": "plan steps for AI citations", "allowed_urls": [], "notes": "planning"}
+{"id": "g003", "query": "summarize today AI policy headlines", "allowed_urls": [], "notes": "news+citations"}
+{"id": "g004", "query": "outline three creative taglines about safety", "allowed_urls": [], "notes": "creative"}
+{"id": "g005", "query": "give 3 bullet takeaways with exactly two citations", "allowed_urls": [], "notes": "format+citations"}

@@ -1,0 +1,310 @@
+"""Synthesis operator using Ollama chat.
+
+Builds a structured prompt from web snippets and generates a
+150–200 word summary with inline citations.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from typing import Any, Dict, Iterable, List, Optional, TypedDict
+from urllib import request, error as urlerror
+
+from app.config import get_config
+from app.operators.searcher import WebSnippet
+
+try:
+    import ollama  # type: ignore
+except Exception:
+    ollama = None  # type: ignore
+
+
+class SynthOutput(TypedDict):
+    answer: str
+    citations: List[str]
+    rationale: str
+
+
+# Citation utilities
+_CITE_RE = re.compile(r'\[(?:1|2)\]\(https?://[^)]+\)')
+
+
+def _append_cite_at_eol(line: str, tag: str) -> str:
+    # strip trailing spaces and stray punctuation-only tails
+    line = line.rstrip()
+    # ensure exactly one space before tag
+    if line and not line.endswith(' '):
+        line += ' '
+    return line + tag
+
+
+def _lock_citations_to_bullets(text: str, citations: list[str]) -> str:
+    """Ensure [1](URL) at end of FIRST bullet and [2](URL) at end of LAST bullet.
+       Remove any other [n](URL) occurrences elsewhere."""
+    if len(citations) < 2:
+        return text
+
+    # normalize variants like "1 (url)" → "[1](url)"
+    text = re.sub(r'\b([12])\s*\((https?://[^)]+)\)', r'[\1](\2)', text)
+
+    lines = text.splitlines()
+    if not lines:
+        return f'[1]({citations[0]})\n[2]({citations[1]})'
+
+    # remove ALL existing [1](...) / [2](...) anywhere
+    lines = [_CITE_RE.sub('', ln) for ln in lines]
+
+    # find targets
+    bullet_idxs = [i for i, ln in enumerate(lines) if ln.strip().startswith('• ')]
+    nonempty_idxs = [i for i, ln in enumerate(lines) if ln.strip()]
+
+    # choose where to pin
+    if len(bullet_idxs) >= 2:
+        i_first, i_last = bullet_idxs[0], bullet_idxs[-1]
+    elif len(nonempty_idxs) >= 2:
+        i_first, i_last = nonempty_idxs[0], nonempty_idxs[-1]
+    else:
+        # single-line fallback
+        i_first = i_last = nonempty_idxs[0] if nonempty_idxs else 0
+
+    # append clean tokens at true EOL
+    lines[i_first] = _append_cite_at_eol(lines[i_first], f'[1]({citations[0]})')
+    if i_last == i_first:
+        # same line: ensure spacing and order [1] then [2]
+        lines[i_last] = _append_cite_at_eol(lines[i_last], f'[2]({citations[1]})')
+    else:
+        lines[i_last] = _append_cite_at_eol(lines[i_last], f'[2]({citations[1]})')
+
+    out = '\n'.join(lines)
+
+    # final sanity: ensure exactly two cites present; if not, force-add at the very end
+    found = _CITE_RE.findall(out)
+    if len(found) < 2:
+        tail = f'\n[1]({citations[0]}) [2]({citations[1]})'
+        out = out.rstrip() + tail
+    elif len(found) > 2:
+        # rare: if something snuck in, strip all and re-append once at end
+        out = _CITE_RE.sub('', out).rstrip() + f'\n[1]({citations[0]}) [2]({citations[1]})'
+
+    return out
+
+
+def _ollama_host() -> str:
+    return os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+
+
+def _http_chat(model: str, messages: List[Dict[str, str]], options: Dict[str, Any]) -> Dict[str, Any] | None:
+    try:
+        url = _ollama_host().rstrip("/") + "/api/chat"
+        payload = {"model": model, "messages": messages, "options": options, "stream": False}
+        data = json.dumps(payload).encode("utf-8")
+        req = request.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        with request.urlopen(req, timeout=60) as resp:  # nosec - local service
+            body = resp.read().decode("utf-8")
+            return json.loads(body)
+    except (urlerror.URLError, TimeoutError, json.JSONDecodeError, Exception):
+        return None
+
+
+def _extract_urls(text: str) -> List[str]:
+    if not isinstance(text, str):
+        return []
+    # Basic URL regex; avoids trailing punctuation
+    urls = re.findall(r"https?://[^\s\]\)>,]+", text)
+    return urls
+
+
+def _build_prompts(snippets: Iterable[WebSnippet]) -> tuple[str, str, List[str]]:
+    system = (
+        "Write 160–190 words. Plain prose only.\n"
+        "Structure exactly:\n"
+        "• one intro sentence\n"
+        "• three bullet lines, each starting with '• '\n"
+        "• one wrap sentence\n"
+        "Use EXACTLY TWO inline citations as [1](URL) and [2](URL), placed at the END of the FIRST and LAST bullet respectively.\n"
+        "Do NOT paste raw titles. Do NOT list citations on separate lines. Cite ONLY the two URLs provided above."
+    )
+
+    lines: List[str] = []
+    urls: List[str] = []
+    snips = list(snippets or [])
+    lines.append("SNIPPETS:")
+    if len(snips) >= 1:
+        u1 = (snips[0].get("url") or "").strip()
+        t1 = (snips[0].get("text") or "").strip()
+        urls.append(u1)
+        lines.append(f"[1] {u1} — SUMMARY: {t1[:120].strip()}…")
+    if len(snips) >= 2:
+        u2 = (snips[1].get("url") or "").strip()
+        t2 = (snips[1].get("text") or "").strip()
+        urls.append(u2)
+        lines.append(f"[2] {u2} — SUMMARY: {t2[:120].strip()}…")
+
+    lines.append(
+        "Write 160–190 words. Structure: 1 intro sentence, 3 bullets (each starts with '• '), 1 wrap sentence. Use ONLY these two URLs. Use exactly two inline citations as [1](URL1) and [2](URL2). Do NOT include any other URLs."
+    )
+
+    user = "\n".join(lines)
+    return system, user, urls
+
+
+def extract_citations(answer: str, snippets: List[Dict[str, Any]]) -> List[str]:
+    # 1) explicit [n](URL)
+    import re as _re
+    urls = _re.findall(r"\[(\d+)\]\((https?://[^\s)]+)\)", answer)
+    if urls:
+        seen: set[str] = set()
+        out: List[str] = []
+        for _n, u in urls:
+            if u not in seen:
+                out.append(u)
+                seen.add(u)
+        return out[:3]
+
+    # 2) fallback: bare [n] → map to snippet URLs
+    idxs = _re.findall(r"\[(\d+)\]", answer)
+    seen2: set[str] = set()
+    out2: List[str] = []
+    for i in idxs:
+        try:
+            j = int(i) - 1
+        except Exception:
+            continue
+        if 0 <= j < len(snippets):
+            u = snippets[j].get("url") or ""
+            if u and u not in seen2:
+                out2.append(u)
+                seen2.add(u)
+    # 3) if still empty, default to first two snippet URLs
+    if not out2:
+        out2 = [s["url"] for s in snippets[:2] if s.get("url")]
+    return out2[:3]
+
+
+def synthesize(
+    snippets: Iterable[WebSnippet],
+    model: Optional[str] = None,
+    system_override: Optional[str] = None,
+) -> SynthOutput:
+    cfg = get_config()
+    chosen_model = model or cfg.get("synthesizer_model")
+    snippet_list: List[WebSnippet] = list(snippets or [])
+    # Use only the first two snippets for the USER prompt numbering
+    snippets_for_prompt = snippet_list[:2]
+    system, user, provided_urls = _build_prompts(snippets_for_prompt)
+    if system_override:
+        system = system_override
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    options = {"temperature": 0.2, "top_p": 0.9, "num_predict": 700}
+
+    content = ""
+
+    # Prefer Python API if available
+    try:
+        if ollama is not None:
+            resp = ollama.chat(model=chosen_model, messages=messages, options=options)  # type: ignore
+            content = (
+                (resp.get("message") or {}).get("content")
+                if isinstance(resp, dict)
+                else ""
+            ) or ""
+        else:
+            resp = _http_chat(chosen_model, messages, options)
+            content = (
+                (resp.get("message") or {}).get("content")
+                if isinstance(resp, dict)
+                else ""
+            ) or ""
+    except Exception:
+        content = ""
+
+    # Fallback if no content was produced
+    if not content:
+        content = (
+            "No model output was generated. Please ensure the synthesizer model is available."
+        )
+
+    # Minimal post-processing: strip <think> blocks only
+    try:
+        answer = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL | re.IGNORECASE).strip()
+    except Exception:
+        answer = content.strip()
+
+    # Helper: Normalize basic bullets for lines that start with dash/number
+    def ensure_bullets(text: str) -> str:
+        lines: List[str] = []
+        for ln in text.splitlines():
+            s = ln.strip()
+            if not s:
+                continue
+            if s.startswith(("-", "*")) or s[:2].isdigit():
+                lines.append("• " + ln.lstrip("-*0123456789. ").strip())
+            else:
+                lines.append(ln)
+        return "\n".join(lines)
+
+    answer = ensure_bullets(answer)
+
+    # Tiny post-process: inline lonely bullet-only citation lines onto previous bullet
+    def inline_lonely_bullet_citations(text: str) -> str:
+        lines = [ln for ln in text.splitlines() if ln.strip() and ln.strip() != "• • •"]
+        out: List[str] = []
+        for ln in lines:
+            m = re.match(r"^\s*•\s*([12])\s*\((https?://[^)]+)\)\s*$", ln)
+            if m and out:
+                n, url = m.group(1), m.group(2)
+                out[-1] = out[-1].rstrip() + f" [{n}]({url})"
+                continue
+            # Also collapse bibliography-style lines like "[1] ... https://..."
+            m2 = re.match(r"^\s*\[([12])\].*?(https?://\S+)", ln)
+            if m2 and out:
+                n, url = m2.group(1), m2.group(2)
+                out[-1] = out[-1].rstrip() + f" [{n}]({url})"
+                continue
+            out.append(ln)
+        return "\n".join(out)
+
+    answer = inline_lonely_bullet_citations(answer)
+
+    # Force exactly two allowed citations and remove others
+    if len(snippets_for_prompt) >= 2:
+        url1, url2 = snippets_for_prompt[0]["url"], snippets_for_prompt[1]["url"]
+        # normalize variants like "1 (url)" → "[1](url)" and reinsert cleanly
+        answer = re.sub(r"\b([12])\s*\((https?://[^)]+)\)", r"[\1](\2)", answer)
+        # strip any existing [1]/[2] cites
+        answer = re.sub(r"\[(?:1|2)\]\(https?://[^)]+\)", "", answer)
+        # strip any raw URLs not in the allowed set
+        def _strip_non_allowed(m):
+            u = m.group(0)
+            return "" if (u != url1 and u != url2) else u
+        answer = re.sub(r"https?://\S+", _strip_non_allowed, answer)
+        # place [1] on first non-empty line, [2] on last non-empty line
+        lines = answer.splitlines()
+        nonempty = [i for i, ln in enumerate(lines) if ln.strip()]
+        if not nonempty:
+            answer = f"[1]({url1}) [2]({url2})"
+        else:
+            fi, li = nonempty[0], nonempty[-1]
+            def _append(i, tag):
+                s = lines[i].rstrip()
+                if s and not s.endswith(" "):
+                    s += " "
+                lines[i] = s + tag
+            _append(fi, f"[1]({url1})")
+            if li == fi:
+                _append(li, f"[2]({url2})")
+            else:
+                _append(li, f"[2]({url2})")
+            answer = "\n".join(lines)
+        citations = [url1, url2]
+    else:
+        citations = []
+
+    return {"answer": answer, "citations": citations, "rationale": "minimal+forced-cites"}
